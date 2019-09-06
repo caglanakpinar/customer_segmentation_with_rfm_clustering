@@ -29,9 +29,9 @@ def KMeans_ClusteringH2O(data, metric):
                                                         ]].as_data_frame(use_pandas=True).rename(
             columns={'predict': 'cluster'})
         rfm_data[metric + '_segment'] = rfm_data[metric + '_segment'].apply(lambda x: x + 1)
-        h2o.shutdown(prompt=True)
+        h2o.shutdown(prompt=False)
     except:
-        h2o.shutdown(prompt=True)
+        h2o.shutdown(prompt=False)
 
     return rfm_data[[metric + '_segment']]
 
