@@ -7,16 +7,16 @@ from scipy.stats import norm
 
 import constants
 
-def KMeans_ClusteringH2O(data, metric):
+def KMeans_ClusteringH2O(data, metric, parameters):
     try:
         h2o.init()
         rfm_data = h2o.H2OFrame(data)
         train, valid = rfm_data.split_frame(ratios=[constants.clustering_parameters['split_ratio']],
                                             seed=constants.clustering_parameters['seed'])
-        rfm_kmeans = H2OKMeansEstimator(k=constants.clustering_parameters['seed'],
+        rfm_kmeans = H2OKMeansEstimator(k=constants.clustering_parameters['k'],
                                         seed=constants.clustering_parameters['seed'],
                                         max_iterations=int(len(data) / 2))
-        rfm_kmeans.train(x='recency', training_frame=train, validation_frame=valid)
+        rfm_kmeans.train(x=metric, training_frame=train, validation_frame=valid)
         grid = H2OGridSearch(model=rfm_kmeans, hyper_params=constants.clustering_parameters['hyper_params'],
                              search_criteria=constants.clustering_parameters['search_criteria'])
         # train using the grid
@@ -25,21 +25,38 @@ def KMeans_ClusteringH2O(data, metric):
         # sort the grid models by total within cluster sum-of-square error.
         sorted_grid = grid.get_grid(sort_by='tot_withinss', decreasing=False)
         prediction = sorted_grid[0].predict(rfm_data)
-        rfm_data = rfm_data.concat(prediction, axis=1)[[metric, metric + '_segment'
-                                                        ]].as_data_frame(use_pandas=True).rename(
-            columns={'predict': 'cluster'})
-        rfm_data[metric + '_segment'] = rfm_data[metric + '_segment'].apply(lambda x: x + 1)
-        h2o.shutdown(prompt=False)
+        data = rfm_data.concat(prediction, axis=1)[[metric, 'predict']].as_data_frame(use_pandas=True)
+        data = data.rename(columns={'predict': metric + '_segment'})
+        data[metric + '_segment'] = data[metric + '_segment'].apply(lambda x: x + 1)
+        if parameters['is_h2o_cluster_shut_down']:
+            h2o.shutdown(prompt=False)
     except:
-        h2o.shutdown(prompt=False)
+        if parameters['is_h2o_cluster_shut_down']:
+            h2o.shutdown(prompt=False)
+    return data
 
-    return rfm_data[[metric + '_segment']]
-
-def current_day_r_f_m_clustering(data):
+def current_day_r_f_m_clustering(data, parameters):
     for metric in constants.METRICS:
-        clustered_data = KMeans_ClusteringH2O(data[metric], metric)
+        clustered_data = KMeans_ClusteringH2O(data[[metric]], metric, parameters)
+        clustered_data = clustered_data.drop(metric, axis=1)
         data = pd.concat([data, clustered_data], axis=1)
     return data
+
+def get_segment_changes(data, metric, metric_values):
+    # Let`s assign each value which are on Critical Point from which segment to which segment
+    df_list = []
+    metric_str = metric_values[1]
+    for row in data.to_dict('results'):
+        d = row
+        d['changing_segment_' + metric_str] = '-'
+        if row['critical_lower_' + metric_str] != '-':
+            if row[metric] > row['critical_lower_' + metric_str]:
+                if row[metric] < row['critical_upper_' + metric_str]:
+                    d['changing_segment_' + metric_str] = str(row[metric+'_segment']) + \
+                                                          '_' + str(row[metric + '_segment'] + 1)
+        df_list.append(d)
+
+    return pd.DataFrame(df_list)
 
 def get_segment_descriptive_stats(data, segment, metric, metric_values):
     segment_values = list(data[data[metric+'_segment'] == segment][metric])
@@ -48,8 +65,9 @@ def get_segment_descriptive_stats(data, segment, metric, metric_values):
     left_tail_critical_point = np.mean(segment_values) + constants.Z_VALUES[0] * np.std(segment_values)
     data['critical_lower_' + metric_values[1]] = left_tail_critical_point
     data['critical_upper_' + metric_values[1]] = right_tail_critical_point
-    data[metric_values[1] + '_mean'] = np.mean(segment_values),
+    data[metric_values[1] + '_mean'] = np.mean(segment_values)
     data[metric_values[1] + '_std'] = np.std(segment_values)
+    data = get_segment_changes(data, metric, metric_values)
     return data
 
 def compute_segment_change(data, prev_data):
@@ -60,7 +78,8 @@ def compute_segment_change(data, prev_data):
             segment_change = get_transicion_matrix_with_probabilities(s, s+1, data, prev_data,
                                                                       constants.METRIC_VALUES[metric]
                                                                       )
-            segment_change_df = pd.concat([segment_change, segment_change_df])
+            segment_change_df = segment_change if len(segment_change_df) == 0 else pd.concat([segment_change,
+                                                                                                segment_change_df])
     return segment_change_df
 
 # in order to calculate the segment change of probability
@@ -74,12 +93,22 @@ def get_transicion_matrix_with_probabilities(segment_1, segment_2, df, prev_df, 
     changing_segment = str(segment_1) + '_' + str(segment_2)
 
     if len(df[df['changing_segment_' + values[1]] == changing_segment]) != 0:
-        df = pd.merge(df, prev_df, on='client_id', how='left')
+        df = pd.merge(df, prev_df.rename(columns={'recency_segment': 'recency_segment_before',
+                                                  'monetary_segment': 'monetary_segment_before',
+                                                  'frequency_segment': 'frequency_segment_before'}),
+                      on='client_id', how='left')
+        asd = df[df[values[0] + '_segment_before'] == segment_1]
         query_str_1 = values[0] + "_segment == @segment_1 and " + values[0] + "_segment_before == @segment_1"
         query_str_2 = values[0] + "_segment == @segment_2 and " + values[0] + "_segment_before == @segment_2"
-        prob_segment_1_1 = len(df.query(query_str_1)) / len(df[df[values[0] + '_segment_before'] == segment_1])
+        if len(df[df[values[0] + '_segment_before'] == segment_1]) != 0:
+            prob_segment_1_1 = len(df.query(query_str_1)) / len(df[df[values[0] + '_segment_before'] == segment_1])
+        else:
+            prob_segment_1_1 = 0.05
         prob_segment_1_2 = 1 - prob_segment_1_1
-        prob_segment_2_2 = len(df.query(query_str_2)) / len(df[df[values[0] + '_segment_before'] == segment_2])
+        if len(df[df[values[0] + '_segment_before'] == segment_2]) != 0:
+            prob_segment_2_2 = len(df.query(query_str_2)) / len(df[df[values[0] + '_segment_before'] == segment_2])
+        else:
+            prob_segment_2_2 = constants.accepted_minimum_prob
         prob_segment_2_1 = 1 - prob_segment_2_2
 
         t_m_df = df.query("changing_segment_" + values[1] + " == @changing_segment")

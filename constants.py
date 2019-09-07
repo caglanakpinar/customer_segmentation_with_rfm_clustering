@@ -9,3 +9,4 @@ clustering_parameters = {'split_ratio': 0.8, 'seed': 1234, 'k': 4,
                          'search_criteria': {'strategy': "Cartesian"}
 
                          }
+accepted_minimum_prob = 0.05
